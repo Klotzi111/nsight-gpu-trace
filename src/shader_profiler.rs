@@ -4,6 +4,9 @@
 //! Blobs are LZ4 blocks whose contents are XORed with an original ChaCha20
 //! keystream (`OBFUSCATION_SIMPLE`). The 32-byte key is recovered at runtime
 //! from the installed WarpViz plugin, like the protobuf descriptors.
+//!
+//! SASS instructions are classified into Nsight's instruction mix classes
+//! (pipe, family, operation) with a table generated from Nsight 2026.3.1.
 
 use std::{
     collections::{BTreeMap, HashMap},
@@ -20,6 +23,7 @@ use crate::{
         enum_name, message_items, message_json, optional_bytes, optional_message, optional_u64,
         u32_items,
     },
+    sass_classes::{CLASSES, SM_VERSIONS},
     spirv_opcodes::OPCODES,
 };
 
@@ -30,6 +34,163 @@ pub const SPIRV_FIRST_INSTRUCTION_LINE: u32 = 6;
 const SASS_INSTRUCTION_SIZE: u64 = 16;
 const MAX_BLOB_UNPACKED: u64 = 1 << 30;
 const CHACHA_CONSTANTS: [u32; 4] = [0x6170_7865, 0x3320_646e, 0x7962_2d32, 0x6b20_6574];
+
+/// Instruction mix pipes, indexed by Nsight's pipe code.
+const SASS_PIPES: [&str; 21] = [
+    "", "ADU", "ALU", "CBU", "FMA", "FP16", "FP64", "IPA", "LDCU", "LSU", "REDUX", "RTCORE", "SCH",
+    "SYNCS", "TEX", "TMA", "TMEM", "Tensor", "UDP", "WORKID", "XU",
+];
+
+/// Instruction mix families, indexed by Nsight's family code.
+const SASS_FAMILIES: [&str; 47] = [
+    "",
+    "Bit Manipulation",
+    "Constant Memory",
+    "Control Flow",
+    "Data Movement",
+    "FP16 Comparison",
+    "FP16 Math",
+    "FP32 Comparison",
+    "FP32 Logic",
+    "FP32 Math",
+    "FP32 Rounding",
+    "FP64 Comparison",
+    "FP64 Conversion",
+    "FP64 Math",
+    "FP64 Rounding",
+    "Float Math",
+    "Float-To-Float",
+    "Float-To-Int",
+    "Generic Memory",
+    "Global Memory",
+    "Int-To-Float",
+    "Integer Arithmetic",
+    "Integer Comparison",
+    "Integer Multiply/Add",
+    "Local Memory",
+    "Logic Operation",
+    "Multicast Memory",
+    "NOP",
+    "PS Attribute",
+    "Performance Monitor",
+    "Ray Tracing",
+    "Resource Control",
+    "Scalar Constant",
+    "Shared Memory",
+    "Special Function",
+    "Special Register",
+    "Surface",
+    "Sync. Barrier",
+    "Tensor",
+    "Tensor Descriptor",
+    "Tensor Memory",
+    "Texture",
+    "Texture Memory",
+    "Uniform Constant",
+    "VTG Attribute",
+    "Vector Constant",
+    "Warp-Level Primitive",
+];
+
+/// Instruction mix operations, indexed by Nsight's operation code.
+const SASS_OPERATIONS: [&str; 50] = [
+    "",
+    "Async Memcpy",
+    "Atomic",
+    "Bitwise",
+    "Branch",
+    "Breakpoint",
+    "Cache Control",
+    "Call",
+    "DEPBAR",
+    "Discard",
+    "ERRBAR",
+    "Exit",
+    "FP!64->FP!64",
+    "FP!64->FP64",
+    "FP->INT!64",
+    "FP->INT64",
+    "FP16",
+    "FP32->INT8",
+    "FP4",
+    "FP64",
+    "FP8",
+    "Fetch",
+    "Fetch w/ Derivatives",
+    "Global MEMBAR",
+    "INT",
+    "INT->FP!64",
+    "INT->FP64",
+    "INT->INT",
+    "INT32->FP32",
+    "LDGDEPBAR",
+    "LOD",
+    "Load",
+    "Load 4",
+    "MEMBAR",
+    "NANOSLEEP",
+    "Prefetch",
+    "Program Start",
+    "Query",
+    "Register",
+    "Return",
+    "SIMT",
+    "Shared MEMBAR",
+    "Shared Memory",
+    "Special",
+    "Store",
+    "TMA",
+    "TMA Memcpy",
+    "TMA Prefetch",
+    "TMA Reduction",
+    "Virtual Resource",
+];
+
+/// Nsight's instruction mix class of one SASS instruction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize)]
+pub struct InstructionClass {
+    pub pipe: &'static str,
+    pub family: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub operation: Option<&'static str>,
+}
+
+impl InstructionClass {
+    /// UI-style name such as `LSU Shared Memory Load`.
+    pub fn label(&self) -> String {
+        [self.pipe, self.family, self.operation.unwrap_or_default()]
+            .into_iter()
+            .filter(|part| !part.is_empty())
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+}
+
+/// Classify a 128-bit SASS instruction for a `cudaSmVersion`, as Nsight's
+/// instruction mix does: the key is the 12-bit opcode plus instruction bit 91.
+pub fn classify_sass(sm_version: u32, encoding: &[u8]) -> Option<InstructionClass> {
+    let column = SM_VERSIONS
+        .iter()
+        .position(|version| *version == sm_version)?;
+    let word = |index: usize| -> Option<u32> {
+        Some(u32::from_le_bytes(
+            encoding.get(index * 4..index * 4 + 4)?.try_into().ok()?,
+        ))
+    };
+    let key = (((word(2)? >> 15) & 0x1000) | (word(0)? & 0xfff)) as u16;
+    let packed = CLASSES
+        .binary_search_by_key(&key, |entry| entry.0)
+        .ok()
+        .map(|index| CLASSES[index].1[column])
+        .filter(|packed| *packed != 0)?;
+    let name = |names: &[&'static str], code: u32| names.get(code as usize).copied();
+    let operation = name(&SASS_OPERATIONS, (packed >> 8) & 0xff)?;
+    Some(InstructionClass {
+        pipe: name(&SASS_PIPES, packed & 0xff)?,
+        family: name(&SASS_FAMILIES, packed >> 16)?,
+        operation: (!operation.is_empty()).then_some(operation),
+    })
+}
 
 /// One shader module (IL bytecode) referenced by the shader profiler.
 #[derive(Debug, Clone, Serialize)]
@@ -69,10 +230,14 @@ pub struct CodeBlock {
     pub module_hash_value: Option<u64>,
     pub module_index: Option<usize>,
     pub line_table_rows: usize,
-    /// SASS instructions correlated with a SPIR-V instruction / a source line.
+    /// `commonProgramMeta.cudaSmVersion`, e.g. 0x80009 for sm_89.
+    pub sm_version: Option<u32>,
+    /// SASS instructions correlated with a SPIR-V instruction / a source
+    /// line / an instruction mix class.
     pub sass_instructions: usize,
     pub sass_with_spirv: usize,
     pub sass_with_source_line: usize,
+    pub sass_classified: usize,
     #[serde(skip)]
     pub sass: Vec<u8>,
     /// One entry per 16-byte SASS instruction.
@@ -87,6 +252,7 @@ pub struct SassCorrelation {
     pub spirv_index: Option<u32>,
     /// Index into [`SpirvModule::locations`].
     pub location: Option<u32>,
+    pub class: Option<InstructionClass>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -564,7 +730,18 @@ impl ShaderProfile {
                 }
                 let module = module_index.and_then(|module| profile.modules[module].spirv.as_ref());
                 let slots = size.div_ceil(SASS_INSTRUCTION_SIZE) as usize;
-                let instructions = correlate(&line_table, slots, module);
+                let mut instructions = correlate(&line_table, slots, module);
+                let sm_version = optional_message(instance, "commonProgramMeta")?
+                    .and_then(|meta| optional_u64(meta, "cudaSmVersion"))
+                    .and_then(|version| u32::try_from(version).ok());
+                if let Some(version) = sm_version {
+                    for (item, encoding) in instructions
+                        .iter_mut()
+                        .zip(sass.chunks(SASS_INSTRUCTION_SIZE as usize))
+                    {
+                        item.class = classify_sass(version, encoding);
+                    }
+                }
                 profile.code_blocks.push(CodeBlock {
                     device_index,
                     index,
@@ -581,6 +758,7 @@ impl ShaderProfile {
                     module_hash_value,
                     module_index,
                     line_table_rows: line_table.len(),
+                    sm_version,
                     sass_instructions: instructions.len(),
                     sass_with_spirv: instructions
                         .iter()
@@ -589,6 +767,10 @@ impl ShaderProfile {
                     sass_with_source_line: instructions
                         .iter()
                         .filter(|item| item.location.is_some())
+                        .count(),
+                    sass_classified: instructions
+                        .iter()
+                        .filter(|item| item.class.is_some())
                         .count(),
                     sass,
                     instructions,
@@ -1426,6 +1608,32 @@ mod tests {
         assert_eq!(lookup8(b""), 0x8db6_3936_9385_75bf);
         assert_eq!(lookup8(&data[..24]), 0xa753_45f1_96a6_716a);
         assert_eq!(lookup8(&data), 0x10a8_ebdd_00c8_cf10);
+    }
+
+    #[test]
+    fn sass_classes_use_the_opcode_and_bit_91() {
+        let instruction = |low: u64, high: u64| {
+            let mut bytes = low.to_le_bytes().to_vec();
+            bytes.extend(high.to_le_bytes());
+            bytes
+        };
+        let label = |sm: u32, bytes: &[u8]| classify_sass(sm, bytes).map(|class| class.label());
+        let nop = instruction(0x7918, 0x000f_e400_0000_0000);
+        let sts = instruction(0x002a_8000_0700_7388, 0x0041_f200_0000_4800);
+        let iadd3 = instruction(0x0000_0014_151e_7211, 0x001f_e200_078e_20ff);
+        assert_eq!(label(0x80009, &nop).as_deref(), Some("SCH NOP"));
+        assert_eq!(
+            label(0x80009, &sts).as_deref(),
+            Some("LSU Shared Memory Store")
+        );
+        assert_eq!(
+            label(0x80009, &iadd3).as_deref(),
+            Some("ALU Integer Arithmetic")
+        );
+        // Bit 91 selects key 0x1211, which has no class.
+        let uniform = instruction(0x7211, 1 << 27);
+        assert_eq!(label(0x80009, &uniform), None);
+        assert_eq!(label(0x90000, &nop), None);
     }
 
     #[test]

@@ -515,6 +515,12 @@ fn pc_sampling_section(
         .take(top)
         .map(|entry| json!({ "name": entry.name, "samples": entry.samples, "share_pct": entry.share_pct }))
         .collect::<Vec<_>>();
+    let instruction_mix = summary
+        .instruction_mix
+        .iter()
+        .take(top)
+        .map(|entry| json!({ "class": entry.label, "samples": entry.samples, "share_pct": entry.share_pct }))
+        .collect::<Vec<_>>();
     let shaders = summary
         .shaders
         .iter()
@@ -526,6 +532,7 @@ fn pc_sampling_section(
                 "samples": shader.samples,
                 "share_pct": shader.share_pct,
                 "leading_sample_type": shader.sample_types.first().map(|entry| &entry.name),
+                "leading_instruction_class": shader.instruction_mix.first().map(|entry| &entry.label),
             })
         })
         .collect::<Vec<_>>();
@@ -541,6 +548,7 @@ fn pc_sampling_section(
                 "samples": hotspot.samples,
                 "share_pct": hotspot.share_pct,
                 "leading_sample_types": hotspot.sample_types.iter().take(3).map(|entry| &entry.name).collect::<Vec<_>>(),
+                "leading_instruction_classes": hotspot.instruction_mix.iter().take(3).map(|entry| &entry.label).collect::<Vec<_>>(),
             })
         })
         .collect::<Vec<_>>();
@@ -551,6 +559,7 @@ fn pc_sampling_section(
         "gpus": summary.gpus,
         "attribution": summary.attribution,
         "sample_types": sample_types,
+        "instruction_mix": instruction_mix,
         "shaders": shaders,
         "hotspot_lines": hotspot_lines,
         "share_basis": hotspots.share_basis,

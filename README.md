@@ -128,12 +128,17 @@ include `calls`, `timings`, `scopes`, `metrics`, `pc-samples`, `artifacts`,
 `pc-samples` reads the per-SM sample storage of real-time shader profiler
 captures and joins it with the shader profiler tables:
 
-- `summary`: sample type (stall reason) distribution and samples per shader;
+- `summary`: sample type (stall reason) distribution, instruction mix, and
+  samples per shader;
 - `shaders`: SPIR-V modules, code blocks, debug-info coverage, and sample counts;
 - `hotspots`: source lines, SPIR-V instructions (`--group-by instruction`), or
   SASS instructions (`--group-by sass`) ranked by samples, each with its sample
-  types;
+  types and instruction mix;
 - `records`: individual samples with PC, interpolated time, SM, and attribution.
+
+The instruction mix uses Nsight's classes (pipe, family, operation, for example
+`LSU Shared Memory Load`) from a table generated with
+`tools/generate_sass_classes.py`.
 
 Shares are percent of the samples selected by `--scope`. Samples have no own
 timestamps; their times are interpolated between per-SM anchors. Nsight appears
@@ -244,9 +249,10 @@ message, and raw protobuf for callers that need direct `prost-reflect` access.
 - Opaque bytes without a documented inner format are inventoried and exported,
   not interpreted speculatively.
 - PC sample attribution is validated on Vulkan/SPIR-V captures from Ada GPUs.
-  SASS is reported as raw encodings; the instruction mix is not decoded yet.
-  Exported `GPUTrace.PCSampler` stall percentages use a weighting that is not
-  reproduced; `pc-samples` reports plain sample counts.
+  SASS is reported as raw encodings with instruction mix classes, without
+  mnemonics. The class table covers the SM versions Nsight Graphics 2026.3.1
+  classifies. Exported `GPUTrace.PCSampler` stall percentages use a weighting
+  that is not reproduced; `pc-samples` reports plain sample counts.
 - The analyzer reads completed captures; it does not launch applications or
   control Nsight capture sessions.
 

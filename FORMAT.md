@@ -249,6 +249,41 @@ The UI's own SPIR-V line numbers differ (for example UI line 1402 for
 instruction index 564 of `detail_still.comp`); its listing apparently also
 counts embedded source text.
 
+### Instruction mix
+
+`ShaderProfilerPlugin.dll` classifies every SASS instruction itself
+(`0x1800b6250`); neither `NvSD.dll` nor the capture stores a class
+(established):
+
+- The key is the 12-bit opcode plus instruction bit 91:
+  `((word2 >> 15) & 0x1000) | (word0 & 0xfff)` over the little-endian 32-bit
+  words of the 128-bit instruction.
+- `codeBlocks[].shaderInstance.commonProgramMeta.cudaSmVersion` selects one
+  function per generation (`0x180064510`): 0x70005 → `0x1800af6f0`,
+  0x80006–0x80009 → `0x1800b2530`, 0xb0000 → `0x1800a9240`, 0xc0000 and
+  0xc0001 → `0x1800ac420`. Other versions, such as 0x80000, 0x90000 and
+  0xa0000, get no class.
+- Each function maps the key to an instruction ID and reads byte tables for
+  family, operation and pipe; the pipe table differs per SM version. An
+  all-zero class counts as "no category".
+- The UI names a class as pipe, family and operation, for example
+  `LSU Shared Memory Load`.
+
+| Code | Pipe | Family | Operation |
+|---:|---|---|---|
+| 1–10 | ADU, ALU, CBU, FMA, FP16, FP64, IPA, LDCU, LSU, REDUX | Bit Manipulation, Constant Memory, Control Flow, Data Movement, FP16 Comparison, FP16 Math, FP32 Comparison, FP32 Logic, FP32 Math, FP32 Rounding | Async Memcpy, Atomic, Bitwise, Branch, Breakpoint, Cache Control, Call, DEPBAR, Discard, ERRBAR |
+| 11–20 | RTCORE, SCH, SYNCS, TEX, TMA, TMEM, Tensor, UDP, WORKID, XU | FP64 Comparison, FP64 Conversion, FP64 Math, FP64 Rounding, Float Math, Float-To-Float, Float-To-Int, Generic Memory, Global Memory, Int-To-Float | Exit, FP!64->FP!64, FP!64->FP64, FP->INT!64, FP->INT64, FP16, FP32->INT8, FP4, FP64, FP8 |
+| 21–30 | — | Integer Arithmetic, Integer Comparison, Integer Multiply/Add, Local Memory, Logic Operation, Multicast Memory, NOP, PS Attribute, Performance Monitor, Ray Tracing | Fetch, Fetch w/ Derivatives, Global MEMBAR, INT, INT->FP!64, INT->FP64, INT->INT, INT32->FP32, LDGDEPBAR, LOD |
+| 31–40 | — | Resource Control, Scalar Constant, Shared Memory, Special Function, Special Register, Surface, Sync. Barrier, Tensor, Tensor Descriptor, Tensor Memory | Load, Load 4, MEMBAR, NANOSLEEP, Prefetch, Program Start, Query, Register, Return, SIMT |
+| 41–50 | — | Texture, Texture Memory, Uniform Constant, VTG Attribute, Vector Constant, Warp-Level Primitive | Shared MEMBAR, Shared Memory, Special, Store, TMA, TMA Memcpy, TMA Prefetch, TMA Reduction, Virtual Resource |
+
+`tools/generate_sass_classes.py` calls the four functions of the 2026.3.1
+plugin for all 8192 keys and writes `src/sass_classes.rs` (847 keys, eight SM
+versions). Restricted to the presented frame, the resulting instruction mix of
+the AD103 capture matches the UI to 0.01 percentage points: all eight listed
+classes and the split of `detail_still.comp:106` (LSU Shared Memory Load
+8.16 %, ALU Integer Arithmetic 3.49 %, FMA FP32 Math 0.37 %).
+
 ## Confidence and unknowns
 
 Confirmed on all six samples:
@@ -266,7 +301,8 @@ Confirmed on the three Vulkan captures from Nsight Graphics 2026.3.1:
 - `ShaderModuleHash` as `lookup8` over the SPIR-V module;
 - the 16-byte PC sample and timestamp anchor records (one capture with
   samples);
-- the per-architecture sample type tables in the 2026.3.1 WarpViz plugin.
+- the per-architecture sample type tables in the 2026.3.1 WarpViz plugin;
+- the SASS instruction mix classification of the 2026.3.1 shader profiler.
 
 Not yet established:
 
@@ -279,7 +315,7 @@ Not yet established:
 - the exact time window behind the UI's sample total;
 - whether the UI carries source lines across `OpLabel`;
 - the UI's SPIR-V line numbering;
-- the SASS instruction classes behind the UI's instruction mix;
+- SASS mnemonics (the instruction mix classes need none);
 - PC sampling on architectures other than Ada and on D3D12 or OpenGL.
 
 The parser rejects unvalidated WRPV versions instead of assuming the v10

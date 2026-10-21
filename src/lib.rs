@@ -23,6 +23,7 @@ mod error;
 pub mod mcp;
 pub mod pc_sampling;
 pub mod perfworks;
+mod sass_classes;
 pub mod shader_profiler;
 mod spirv_opcodes;
 pub mod trace;
@@ -47,5 +48,7 @@ pub use perfworks::{
     MetricDescriptor, MetricEvaluation, MetricKind, MetricSample, MetricScan, MetricsApi,
     PerfWorks, SampleInfo,
 };
-pub use shader_profiler::{CodeBlock, ShaderModule, ShaderProfile, SpirvModule};
+pub use shader_profiler::{
+    CodeBlock, InstructionClass, ShaderModule, ShaderProfile, SpirvModule, classify_sass,
+};
 pub use trace::{ByteField, QueryOptions, SchemaField, TraceDocument};

@@ -11,7 +11,8 @@ use crate::{
     Error, Result, Scope, ScopeKind, TraceDocument,
     analysis::{message_items, optional_bytes, optional_message, optional_string, optional_u64},
     shader_profiler::{
-        CodeBlock, SPIRV_FIRST_INSTRUCTION_LINE, ShaderProfile, file_basename, format_hash,
+        CodeBlock, InstructionClass, SPIRV_FIRST_INSTRUCTION_LINE, ShaderProfile, file_basename,
+        format_hash,
     },
 };
 
@@ -197,12 +198,25 @@ pub struct SampleTypeCount {
     pub share_pct: f64,
 }
 
+/// Samples of one instruction mix class; `None` fields mark unclassified samples.
+#[derive(Debug, Clone, Serialize)]
+pub struct InstructionClassCount {
+    pub label: String,
+    pub pipe: Option<&'static str>,
+    pub family: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub operation: Option<&'static str>,
+    pub samples: usize,
+    pub share_pct: f64,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct AttributionCounts {
     pub in_code_blocks: usize,
     pub outside_code_blocks: usize,
     pub with_spirv_instruction: usize,
     pub with_source_line: usize,
+    pub with_instruction_class: usize,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -213,6 +227,7 @@ pub struct ShaderSamples {
     pub samples: usize,
     pub share_pct: f64,
     pub sample_types: Vec<SampleTypeCount>,
+    pub instruction_mix: Vec<InstructionClassCount>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -229,6 +244,7 @@ pub struct PcSamplingSummary {
     pub untimed_samples_excluded: usize,
     pub attribution: AttributionCounts,
     pub sample_types: Vec<SampleTypeCount>,
+    pub instruction_mix: Vec<InstructionClassCount>,
     pub shaders: Vec<ShaderSamples>,
     pub time_attribution: &'static str,
     pub exact_per_sample_timestamps: bool,
@@ -269,6 +285,7 @@ pub struct Hotspot {
     pub samples: usize,
     pub share_pct: f64,
     pub sample_types: Vec<SampleTypeCount>,
+    pub instruction_mix: Vec<InstructionClassCount>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -302,11 +319,37 @@ pub struct SampleRecord {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sass_offset: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub instruction_class: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub spirv_index: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub file: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub line: Option<u32>,
+}
+
+/// Per-group sample counts by sample type and instruction mix class.
+struct GroupCounts {
+    types: Box<[usize; 256]>,
+    classes: HashMap<Option<InstructionClass>, usize>,
+}
+
+impl GroupCounts {
+    fn new() -> Self {
+        Self {
+            types: Box::new([0; 256]),
+            classes: HashMap::new(),
+        }
+    }
+
+    fn add(&mut self, sample_type: u8, class: Option<InstructionClass>) {
+        self.types[usize::from(sample_type)] += 1;
+        *self.classes.entry(class).or_default() += 1;
+    }
+
+    fn total(&self) -> usize {
+        self.types.iter().sum()
+    }
 }
 
 /// Samples chosen by a scope, as indices into the decoded sample list.
@@ -484,18 +527,20 @@ impl PcSampling {
     pub fn summary(&self, scope: &Scope) -> Result<PcSamplingSummary> {
         let selection = self.select(scope)?;
         let total = selection.indices.len();
-        let mut reasons = [0usize; 256];
+        let mut overall = GroupCounts::new();
         let mut attribution = AttributionCounts {
             in_code_blocks: 0,
             outside_code_blocks: 0,
             with_spirv_instruction: 0,
             with_source_line: 0,
+            with_instruction_class: 0,
         };
-        let mut shaders: BTreeMap<ShaderKey, (Vec<usize>, Box<[usize; 256]>)> = BTreeMap::new();
+        let mut shaders: BTreeMap<ShaderKey, (Vec<usize>, GroupCounts)> = BTreeMap::new();
         for index in &selection.indices {
             let sample = &self.samples[*index];
-            reasons[usize::from(sample.sample_type)] += 1;
             let location = self.profile.locate(sample.pc);
+            let class = location.and_then(|location| location.correlation.class);
+            overall.add(sample.sample_type, class);
             let key = match location {
                 Some(location) => {
                     attribution.in_code_blocks += 1;
@@ -504,6 +549,9 @@ impl PcSampling {
                     }
                     if location.correlation.location.is_some() {
                         attribution.with_source_line += 1;
+                    }
+                    if class.is_some() {
+                        attribution.with_instruction_class += 1;
                     }
                     self.shader_key(location.code_block)
                 }
@@ -514,19 +562,19 @@ impl PcSampling {
             };
             let entry = shaders
                 .entry(key)
-                .or_insert_with(|| (Vec::new(), Box::new([0; 256])));
+                .or_insert_with(|| (Vec::new(), GroupCounts::new()));
             if let Some(location) = location
                 && !entry.0.contains(&location.code_block)
             {
                 entry.0.push(location.code_block);
             }
-            entry.1[usize::from(sample.sample_type)] += 1;
+            entry.1.add(sample.sample_type, class);
         }
         let mut shader_rows: Vec<_> = shaders
             .into_iter()
             .map(|(key, (mut blocks, counts))| {
                 blocks.sort_unstable();
-                let samples = counts.iter().sum();
+                let samples = counts.total();
                 ShaderSamples {
                     shader: self.shader_label(&key),
                     hash: key.hash(),
@@ -536,7 +584,8 @@ impl PcSampling {
                         .collect(),
                     samples,
                     share_pct: share(samples, total),
-                    sample_types: self.type_counts(counts.as_ref(), samples),
+                    sample_types: self.type_counts(&counts.types, samples),
+                    instruction_mix: class_counts(&counts.classes, samples),
                 }
             })
             .collect();
@@ -558,7 +607,8 @@ impl PcSampling {
             selected_samples: total,
             untimed_samples_excluded: selection.untimed,
             attribution,
-            sample_types: self.type_counts(&reasons, total),
+            sample_types: self.type_counts(&overall.types, total),
+            instruction_mix: class_counts(&overall.classes, total),
             shaders: shader_rows,
             time_attribution: TIME_ATTRIBUTION,
             exact_per_sample_timestamps: false,
@@ -575,7 +625,7 @@ impl PcSampling {
     ) -> Result<HotspotReport> {
         let selection = self.select(scope)?;
         let total = selection.indices.len();
-        let mut groups: HashMap<HotspotKey, Box<[usize; 256]>> = HashMap::new();
+        let mut groups: HashMap<HotspotKey, GroupCounts> = HashMap::new();
         let mut matching = 0usize;
         for index in &selection.indices {
             let sample = &self.samples[*index];
@@ -605,12 +655,14 @@ impl PcSampling {
                     HotspotKey::Sass(location.code_block, location.offset & !15)
                 }
             };
-            groups.entry(key).or_insert_with(|| Box::new([0; 256]))
-                [usize::from(sample.sample_type)] += 1;
+            groups.entry(key).or_insert_with(GroupCounts::new).add(
+                sample.sample_type,
+                location.and_then(|location| location.correlation.class),
+            );
         }
         let mut hotspots: Vec<_> = groups
             .into_iter()
-            .map(|(key, counts)| self.hotspot(&key, counts.as_ref(), total))
+            .map(|(key, counts)| self.hotspot(&key, &counts, total))
             .collect();
         hotspots.sort_by(|left, right| {
             right
@@ -673,6 +725,9 @@ impl PcSampling {
                     shader_hash: block.and_then(|block| block.module_hash.clone()),
                     code_block: block.map(|block| block.index),
                     sass_offset: location.map(|location| location.offset),
+                    instruction_class: location
+                        .and_then(|location| location.correlation.class)
+                        .map(|class| class.label()),
                     spirv_index: location.and_then(|location| location.correlation.spirv_index),
                     file: source.as_ref().map(|source| file_basename(&source.0)),
                     line: source.map(|source| source.1),
@@ -848,8 +903,8 @@ impl PcSampling {
         result
     }
 
-    fn hotspot(&self, key: &HotspotKey, counts: &[usize; 256], total: usize) -> Hotspot {
-        let samples = counts.iter().sum();
+    fn hotspot(&self, key: &HotspotKey, counts: &GroupCounts, total: usize) -> Hotspot {
+        let samples = counts.total();
         let mut hotspot = Hotspot {
             shader: String::new(),
             shader_hash: None,
@@ -864,7 +919,8 @@ impl PcSampling {
             sass_encoding: None,
             samples,
             share_pct: share(samples, total),
-            sample_types: self.type_counts(counts, samples),
+            sample_types: self.type_counts(&counts.types, samples),
+            instruction_mix: class_counts(&counts.classes, samples),
         };
         match key {
             HotspotKey::Unattributed => {
@@ -980,6 +1036,31 @@ fn sass_encoding(block: &CodeBlock, offset: u64) -> Option<String> {
     let low = u64::from_le_bytes(bytes[..8].try_into().ok()?);
     let high = u64::from_le_bytes(bytes[8..].try_into().ok()?);
     Some(format!("{low:#018x} {high:#018x}"))
+}
+
+/// Instruction mix rows sorted by samples; unclassified samples get `None` fields.
+fn class_counts(
+    counts: &HashMap<Option<InstructionClass>, usize>,
+    total: usize,
+) -> Vec<InstructionClassCount> {
+    let mut result: Vec<_> = counts
+        .iter()
+        .map(|(class, samples)| InstructionClassCount {
+            label: class.map_or_else(|| "(unclassified)".into(), |class| class.label()),
+            pipe: class.map(|class| class.pipe),
+            family: class.map(|class| class.family),
+            operation: class.and_then(|class| class.operation),
+            samples: *samples,
+            share_pct: share(*samples, total),
+        })
+        .collect();
+    result.sort_by(|left, right| {
+        right
+            .samples
+            .cmp(&left.samples)
+            .then_with(|| left.label.cmp(&right.label))
+    });
+    result
 }
 
 fn share(part: usize, total: usize) -> f64 {
