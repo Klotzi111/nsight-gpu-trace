@@ -8,6 +8,7 @@ use serde::Serialize;
 
 use crate::{
     Error, Result, TraceDocument,
+    pc_sampling::PcSampling,
     perfworks::{
         CounterImage, CounterImageInfo, MetricBase, MetricCatalog, MetricDescriptor,
         MetricEvaluation, MetricSample, MetricScan, MetricsApi, PerfWorks, SampleInfo,
@@ -337,6 +338,7 @@ pub struct Analysis {
     debug_groups: Vec<DebugGroup>,
     nvtx_ranges: Vec<NvtxRange>,
     counters: Option<CounterState>,
+    pc_sampling: Option<PcSampling>,
 }
 
 impl std::fmt::Debug for Analysis {
@@ -377,6 +379,7 @@ impl Analysis {
             debug_groups,
             nvtx_ranges,
             counters: None,
+            pc_sampling: None,
         })
     }
 
@@ -917,6 +920,15 @@ impl Analysis {
             ),
         );
         Ok(result)
+    }
+
+    /// Decode real-time shader profiler PC samples and the shader tables used
+    /// to attribute them. Captures without samples yield an empty result.
+    pub fn pc_sampling(&mut self) -> Result<&PcSampling> {
+        if self.pc_sampling.is_none() {
+            self.pc_sampling = Some(PcSampling::from_document(&self.document)?);
+        }
+        Ok(self.pc_sampling.as_ref().unwrap())
     }
 
     pub fn counter_info(&mut self) -> Result<&CounterImageInfo> {
@@ -1816,7 +1828,7 @@ fn histogram<T: Ord>(values: impl IntoIterator<Item = T>) -> BTreeMap<T, usize> 
     result
 }
 
-fn message_items<'a>(
+pub(crate) fn message_items<'a>(
     message: &'a DynamicMessage,
     name: &str,
 ) -> Result<impl Iterator<Item = &'a DynamicMessage>> {
@@ -1852,7 +1864,7 @@ fn message_items<'a>(
     }))
 }
 
-fn optional_message<'a>(
+pub(crate) fn optional_message<'a>(
     message: &'a DynamicMessage,
     name: &str,
 ) -> Result<Option<&'a DynamicMessage>> {
@@ -1886,10 +1898,31 @@ fn required_string(message: &DynamicMessage, name: &str) -> Result<String> {
     })
 }
 
-fn optional_string(message: &DynamicMessage, name: &str) -> Option<String> {
+pub(crate) fn optional_string(message: &DynamicMessage, name: &str) -> Option<String> {
     match field_value(message, name) {
         Some(Value::String(value)) => Some(value.clone()),
         _ => None,
+    }
+}
+
+pub(crate) fn optional_bytes<'a>(message: &'a DynamicMessage, name: &str) -> Option<&'a [u8]> {
+    match field_value(message, name) {
+        Some(Value::Bytes(value)) => Some(value.as_ref()),
+        _ => None,
+    }
+}
+
+pub(crate) fn u32_items(message: &DynamicMessage, name: &str) -> Vec<u32> {
+    match field_value(message, name) {
+        Some(Value::List(items)) => items
+            .iter()
+            .filter_map(|item| match item {
+                Value::U32(value) => Some(*value),
+                Value::U64(value) => u32::try_from(*value).ok(),
+                _ => None,
+            })
+            .collect(),
+        _ => Vec::new(),
     }
 }
 
@@ -1903,7 +1936,7 @@ fn required_u64(message: &DynamicMessage, name: &str) -> Result<u64> {
     })
 }
 
-fn optional_u64(message: &DynamicMessage, name: &str) -> Option<u64> {
+pub(crate) fn optional_u64(message: &DynamicMessage, name: &str) -> Option<u64> {
     match field_value(message, name) {
         Some(Value::U64(value)) => Some(*value),
         Some(Value::U32(value)) => Some(u64::from(*value)),
@@ -1913,7 +1946,7 @@ fn optional_u64(message: &DynamicMessage, name: &str) -> Option<u64> {
     }
 }
 
-fn enum_name(message: &DynamicMessage, name: &str) -> Result<Option<String>> {
+pub(crate) fn enum_name(message: &DynamicMessage, name: &str) -> Result<Option<String>> {
     let descriptor = message.descriptor();
     let field = descriptor.get_field_by_name(name).ok_or_else(|| {
         Error::Protobuf(format!("{} has no field {name}", descriptor.full_name()))
@@ -1936,7 +1969,7 @@ fn enum_name(message: &DynamicMessage, name: &str) -> Result<Option<String>> {
     ))
 }
 
-fn message_json(message: &DynamicMessage) -> Result<serde_json::Value> {
+pub(crate) fn message_json(message: &DynamicMessage) -> Result<serde_json::Value> {
     Ok(serde_json::to_value(message)?)
 }
 

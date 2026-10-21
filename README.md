@@ -21,6 +21,9 @@ formulas, or capture data.
   the metrics actually present in a capture.
 - Computes time-weighted metric summaries with explicit coverage and `null`
   semantics.
+- Decodes real-time shader profiler PC samples and attributes each one to its
+  shader, SASS instruction, SPIR-V instruction, and source line, optionally
+  restricted to any time, call, frame, or labeled scope.
 - Exports the raw protobuf, descriptors, JSON, byte fields, counter image, and
   WRPV sections without overwriting existing files.
 - Provides bounded MCP tools for trace triage and capture-driven optimization.
@@ -107,11 +110,37 @@ ngfx-trace metrics describe capture.ngfx-gputrace sm__throughput.avg.pct_of_peak
 # Rank scopes and run bounded top-down triage.
 ngfx-trace scopes capture.ngfx-gputrace debug-group --limit 50
 ngfx-trace report capture.ngfx-gputrace --top 20
+
+# Real-time shader profiler PC samples (captured with --real-time-shader-profiler).
+ngfx-trace pc-samples summary capture.ngfx-gputrace --scope frame:presented:0:0:0
+ngfx-trace pc-samples hotspots capture.ngfx-gputrace --group-by line --limit 20
+ngfx-trace pc-samples hotspots capture.ngfx-gputrace --group-by instruction --shader still
+ngfx-trace pc-samples shaders capture.ngfx-gputrace
+ngfx-trace pc-samples records capture.ngfx-gputrace --scope calls:120..140 --sm 3
 ```
 
 Run `ngfx-trace <command> --help` for the complete options. Major command groups
-include `calls`, `timings`, `scopes`, `metrics`, `artifacts`, `extract`,
-`section`, `unpack`, `schema`, `query`, and `json`.
+include `calls`, `timings`, `scopes`, `metrics`, `pc-samples`, `artifacts`,
+`extract`, `section`, `unpack`, `schema`, `query`, and `json`.
+
+## PC samples
+
+`pc-samples` reads the per-SM sample storage of real-time shader profiler
+captures and joins it with the shader profiler tables:
+
+- `summary`: sample type (stall reason) distribution and samples per shader;
+- `shaders`: SPIR-V modules, code blocks, debug-info coverage, and sample counts;
+- `hotspots`: source lines, SPIR-V instructions (`--group-by instruction`), or
+  SASS instructions (`--group-by sass`) ranked by samples, each with its sample
+  types;
+- `records`: individual samples with PC, interpolated time, SM, and attribution.
+
+Shares are percent of the samples selected by `--scope`. Samples have no own
+timestamps; their times are interpolated between per-SM anchors. Nsight appears
+to count only samples inside the trace range, so `--scope frame:...` reproduces
+the UI percentages more closely than the default whole-capture scope. Shader blobs are
+decoded with a key recovered at runtime from the installed WarpViz plugin.
+Captures without samples report `available: false` and the reason.
 
 ## MCP server
 
@@ -151,8 +180,12 @@ The MCP advertises two tools:
 - `query_capture` executes up to 16 discriminated queries against one freshly
   opened capture. Query types cover container sections, calls, timings, scopes,
   counter samples, metric discovery/descriptions/evaluation, trace schema/data,
-  artifact inventory, and bounded artifact reads. Each paged query accepts its
-  own stateless offset.
+  artifact inventory, bounded artifact reads, and PC sampling (`pc_sampling`
+  with the views `summary`, `shaders`, `hotspots`, and `records`). Each paged
+  query accepts its own stateless offset.
+
+`analyze_capture` also includes a compact PC sampling section with the leading
+sample types, shaders, and source lines when the capture has samples.
 
 Default responses omit metric sample series, call arguments, and binary
 payloads. Regex metric selectors in `metric_evaluation` scan and evaluate the
@@ -210,6 +243,10 @@ message, and raw protobuf for callers that need direct `prost-reflect` access.
 - Proprietary `GPUTrace.*` UI formulas are not reimplemented.
 - Opaque bytes without a documented inner format are inventoried and exported,
   not interpreted speculatively.
+- PC sample attribution is validated on Vulkan/SPIR-V captures from Ada GPUs.
+  SASS is reported as raw encodings; the instruction mix is not decoded yet.
+  Exported `GPUTrace.PCSampler` stall percentages use a weighting that is not
+  reproduced; `pc-samples` reports plain sample counts.
 - The analyzer reads completed captures; it does not launch applications or
   control Nsight capture sessions.
 
