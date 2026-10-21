@@ -8,7 +8,10 @@ use serde::Serialize;
 
 use crate::{
     Error, Result, TraceDocument,
-    pc_sampling::PcSampling,
+    pc_sampling::{
+        PcSampling, TPC_ACTIVE_WARP_METRICS, TPC_CYCLES_METRIC, TpcCounterRange,
+        WarpWeightedSummary,
+    },
     perfworks::{
         CounterImage, CounterImageInfo, MetricBase, MetricCatalog, MetricDescriptor,
         MetricEvaluation, MetricSample, MetricScan, MetricsApi, PerfWorks, SampleInfo,
@@ -339,6 +342,8 @@ pub struct Analysis {
     nvtx_ranges: Vec<NvtxRange>,
     counters: Option<CounterState>,
     pc_sampling: Option<PcSampling>,
+    /// Per-TPC counter ranges for the PC sampler warp weighting, with warnings.
+    tpc_counters: Option<(Vec<TpcCounterRange>, Vec<String>)>,
 }
 
 impl std::fmt::Debug for Analysis {
@@ -380,6 +385,7 @@ impl Analysis {
             nvtx_ranges,
             counters: None,
             pc_sampling: None,
+            tpc_counters: None,
         })
     }
 
@@ -929,6 +935,69 @@ impl Analysis {
             self.pc_sampling = Some(PcSampling::from_document(&self.document)?);
         }
         Ok(self.pc_sampling.as_ref().unwrap())
+    }
+
+    /// Nsight's `GPUTrace.PCSampler` warp metrics for a scope: PC samples
+    /// weighted by the active warps the periodic counters measured per TPC.
+    pub fn pc_sampling_warp_weighted(&mut self, scope: &Scope) -> Result<WarpWeightedSummary> {
+        if self.tpc_counters.is_none() {
+            let instances = self.pc_sampling()?.tpc_instances()?;
+            let api = self.metrics_api()?;
+            let counters = self.ensure_counters()?;
+            let ranges = 0..counters.info.periodic_sampler.populated_ranges;
+            let evaluate = |metric: &str| {
+                counters.perfworks.evaluate_instances(
+                    api,
+                    &counters.image,
+                    metric,
+                    instances,
+                    ranges.clone(),
+                )
+            };
+            let cycles = evaluate(TPC_CYCLES_METRIC)?;
+            let mut warps = vec![vec![0.0; instances]; cycles.len()];
+            let mut warnings = Vec::new();
+            for metric in TPC_ACTIVE_WARP_METRICS {
+                match evaluate(metric) {
+                    Ok(values) => {
+                        for (sum, row) in warps.iter_mut().zip(values) {
+                            for (sum, value) in sum.iter_mut().zip(row) {
+                                if value.is_finite() {
+                                    *sum += value;
+                                }
+                            }
+                        }
+                    }
+                    Err(error) if metric != TPC_ACTIVE_WARP_METRICS[2] => {
+                        warnings.push(format!(
+                            "{metric} is unavailable and counts as zero: {error}"
+                        ));
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+            let ranges = counters
+                .sample_info
+                .iter()
+                .zip(cycles.into_iter().zip(warps))
+                .map(|(info, (cycles, active_warps))| TpcCounterRange {
+                    range_index: info.range_index,
+                    start_ns: info.timestamp_start_ns,
+                    end_ns: info.timestamp_end_ns,
+                    cycles,
+                    active_warps,
+                })
+                .collect();
+            self.tpc_counters = Some((ranges, warnings));
+        }
+        let (ranges, warnings) = self.tpc_counters.as_ref().unwrap();
+        let mut summary = self
+            .pc_sampling
+            .as_ref()
+            .unwrap()
+            .warp_weighted(ranges, scope)?;
+        summary.warnings.extend(warnings.iter().cloned());
+        Ok(summary)
     }
 
     pub fn counter_info(&mut self) -> Result<&CounterImageInfo> {

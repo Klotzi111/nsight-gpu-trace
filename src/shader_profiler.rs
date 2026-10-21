@@ -221,6 +221,9 @@ pub struct CodeBlock {
     pub shader_type: Option<String>,
     pub origin: Option<String>,
     pub function_groups: Vec<serde_json::Value>,
+    /// API pipeline handle of the first function group; the Nsight UI names
+    /// shaders by it (`0x000002d9803638d0 - main`).
+    pub pipeline: Option<String>,
     pub program_meta: serde_json::Value,
     pub instructions_blob: Option<usize>,
     pub debug_blob: Option<usize>,
@@ -474,10 +477,11 @@ impl SpirvModule {
             {
                 module.type_names.insert(id, name);
             }
-            // OpLabel and OpFunctionEnd end the current line scope. Nsight keeps
-            // the previous line across OpNoLine, unlike the SPIR-V rule; this
-            // matches its attribution of an OpSelect that follows OpNoLine.
-            if matches!(opcode, 248 | 56) {
+            // Unlike the SPIR-V rule, Nsight keeps the last line across OpNoLine
+            // and OpLabel until the next line or the end of the function; this
+            // matches its attribution of samples on OpSelect after OpNoLine and
+            // on OpLabel instructions.
+            if opcode == 56 {
                 current = None;
             }
             module.instructions.push(SpirvInstruction {
@@ -486,10 +490,7 @@ impl SpirvModule {
                 result_type,
                 result_id,
             });
-            module.instruction_locations.push(match opcode {
-                8 | 317 | 248 | 56 => None,
-                _ => current,
-            });
+            module.instruction_locations.push(current);
             offset += word_count;
         }
         module.debug_info = match (has_op_line, has_debug_line) {
@@ -693,10 +694,17 @@ impl ShaderProfile {
                         program_meta.insert(field.into(), message_json(meta)?);
                     }
                 }
-                let function_groups = u32_items(instance, "functionGroupIndices")
+                let function_groups: Vec<_> = u32_items(instance, "functionGroupIndices")
                     .into_iter()
                     .filter_map(|group| groups.get(group as usize).cloned())
                     .collect();
+                // Each group holds one pipeline message, e.g. `computePipeline`.
+                let pipeline = function_groups.iter().find_map(|group| {
+                    group
+                        .as_object()?
+                        .values()
+                        .find_map(|pipeline| Some(pipeline.get("name")?.as_str()?.to_owned()))
+                });
                 let sass = instructions_blob
                     .and_then(|blob| decode(blob, &mut profile.warnings))
                     .unwrap_or_default();
@@ -750,6 +758,7 @@ impl ShaderProfile {
                     shader_type: enum_name(instance, "type")?,
                     origin: enum_name(instance, "origin")?,
                     function_groups,
+                    pipeline,
                     program_meta: program_meta.into(),
                     instructions_blob,
                     debug_blob,
@@ -1687,7 +1696,7 @@ mod tests {
     }
 
     #[test]
-    fn op_line_scopes_survive_no_line_and_end_at_labels() {
+    fn op_line_scopes_last_until_the_function_ends() {
         let file = string_operands("C:/shaders/a.comp");
         let mut op_string = vec![((2 + file.len() as u32) << 16) | 7, 1];
         op_string.extend(&file);
@@ -1700,9 +1709,11 @@ mod tests {
             vec![(5 << 16) | 129, 2, 10, 5, 5],
             vec![(2 << 16) | 248, 7],
             vec![(5 << 16) | 129, 2, 8, 9, 9],
+            vec![(1 << 16) | 56],
+            vec![(5 << 16) | 129, 2, 11, 9, 9],
         ]);
         let parsed = SpirvModule::parse(&module).unwrap();
-        assert_eq!(parsed.instructions.len(), 8);
+        assert_eq!(parsed.instructions.len(), 10);
         let location = parsed.instruction_locations[3].unwrap();
         assert_eq!(
             parsed.locations[location as usize],
@@ -1711,9 +1722,11 @@ mod tests {
                 line: 42
             }
         );
-        assert_eq!(parsed.instruction_locations[4], None);
-        assert_eq!(parsed.instruction_locations[5], Some(location));
-        assert_eq!(parsed.instruction_locations[7], None);
+        for index in 4..8 {
+            assert_eq!(parsed.instruction_locations[index], Some(location));
+        }
+        assert_eq!(parsed.instruction_locations[8], None);
+        assert_eq!(parsed.instruction_locations[9], None);
         assert_eq!(parsed.describe(3).as_deref(), Some("OpFAdd %float"));
     }
 

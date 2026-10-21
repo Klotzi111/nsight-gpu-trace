@@ -13,12 +13,13 @@ use serde_json::{Map, Value, json};
 use crate::{
     Analysis, AnalysisOptions, ApiCall, CallKind, Container, HotspotGrouping, MetricKind,
     MetricScan, MetricStatistics, QueryOptions, Result, Scope, ScopeKind, ScopeMetricSummary,
-    TimingBucket, TopDownReport, diagnostics::metric_category, top_down_report,
+    TimingBucket, TopDownReport, diagnostics::metric_category, pc_sampling::WarpWeightedCount,
+    top_down_report,
 };
 
 const PROTOCOL_VERSIONS: &[&str] = &["2026-07-28", "2025-11-25", "2025-06-18", "2025-03-26"];
 const FALLBACK_PROTOCOL: &str = "2025-06-18";
-const INSTRUCTIONS: &str = "Pass a .ngfx-gputrace path to every tool call. Use analyze_capture for one-shot triage and query_capture for bounded follow-up queries. Null means unavailable, never zero. bucket_shared evidence belongs to the whole timing bucket. PC sample shares are percent of the samples selected by the scope, and sample times are interpolated between per-SM anchors. Treat thresholds as hypotheses and validate changes with a same-settings recapture.";
+const INSTRUCTIONS: &str = "Pass a .ngfx-gputrace path to every tool call. Use analyze_capture for one-shot triage and query_capture for bounded follow-up queries. Null means unavailable, never zero. bucket_shared evidence belongs to the whole timing bucket. PC sample shares are percent of the samples selected by the scope; a time scope selects every sample whose assigned counter range overlaps it, and line hotspots count each pipeline separately, as the Nsight UI does. warp_weighted values reproduce Nsight's GPUTrace.PCSampler export (average warps and percent of SM warp slots). Treat thresholds as hypotheses and validate changes with a same-settings recapture.";
 const DEFAULT_TOP: usize = 8;
 const MAX_TOP: usize = 25;
 const MAX_QUERIES: usize = 16;
@@ -543,15 +544,45 @@ fn pc_sampling_section(
         .map(|hotspot| {
             json!({
                 "shader": hotspot.shader,
+                "pipeline": hotspot.pipeline,
                 "file": hotspot.file,
                 "line": hotspot.line,
                 "samples": hotspot.samples,
                 "share_pct": hotspot.share_pct,
+                "sass_instructions": hotspot.sass_instructions,
                 "leading_sample_types": hotspot.sample_types.iter().take(3).map(|entry| &entry.name).collect::<Vec<_>>(),
                 "leading_instruction_classes": hotspot.instruction_mix.iter().take(3).map(|entry| &entry.label).collect::<Vec<_>>(),
             })
         })
         .collect::<Vec<_>>();
+    let warp_weighted = match analysis.pc_sampling_warp_weighted(&scope) {
+        Ok(weighted) => {
+            let rows = |entries: &[WarpWeightedCount]| {
+                entries
+                    .iter()
+                    .take(top)
+                    .map(|entry| {
+                        json!({
+                            "name": entry.name,
+                            "hash": entry.hash,
+                            "avg_warps": entry.avg_warps,
+                            "pct_of_peak": entry.pct_of_peak,
+                            "share_pct": entry.share_pct,
+                        })
+                    })
+                    .collect::<Vec<_>>()
+            };
+            json!({
+                "basis": weighted.basis,
+                "peak_warps_per_sm": weighted.peak_warps_per_sm,
+                "attributed_avg_warps": weighted.attributed_avg_warps,
+                "unattributed_avg_warps": weighted.unattributed_avg_warps,
+                "sample_types": rows(&weighted.sample_types),
+                "shaders": rows(&weighted.shaders),
+            })
+        }
+        Err(error) => json!({ "available": false, "error": error.to_string() }),
+    };
     json!({
         "available": true,
         "records": summary.records,
@@ -561,6 +592,7 @@ fn pc_sampling_section(
         "sample_types": sample_types,
         "instruction_mix": instruction_mix,
         "shaders": shaders,
+        "warp_weighted": warp_weighted,
         "hotspot_lines": hotspot_lines,
         "share_basis": hotspots.share_basis,
         "time_attribution": summary.time_attribution,
@@ -1473,6 +1505,14 @@ fn pc_sampling_query(
                 .map_err(|error| error.to_string())?;
             let mut value = serde_json::to_value(&summary).map_err(|error| error.to_string())?;
             value["shaders"] = paged(&summary.shaders, offset, limit)?;
+            if query.get("warp_weighted").and_then(Value::as_bool) == Some(true) {
+                value["warp_weighted"] = match analysis.pc_sampling_warp_weighted(&scope) {
+                    Ok(weighted) => {
+                        serde_json::to_value(weighted).map_err(|error| error.to_string())?
+                    }
+                    Err(error) => json!({ "available": false, "error": error.to_string() }),
+                };
+            }
             Ok(value)
         }
         "shaders" => {
@@ -1700,11 +1740,12 @@ fn query_schemas() -> Vec<Value> {
                     "type": "string",
                     "enum": ["summary", "shaders", "hotspots", "records"],
                     "default": "summary",
-                    "description": "summary: sample types and shaders; shaders: modules, code blocks, debug info; hotspots: ranked lines, SPIR-V or SASS instructions; records: decoded samples."
+                    "description": "summary: sample types and shaders; shaders: modules, code blocks, debug info; hotspots: ranked source lines per pipeline, SPIR-V or SASS instructions, with SASS instruction counts; records: decoded samples."
                 },
                 "scope": { "type": "string", "default": "capture", "description": "capture, a scope ID, calls:A..B, time:A..B, or relative-time:A..B." },
                 "group_by": { "type": "string", "enum": ["line", "instruction", "sass"], "default": "line" },
                 "shader_pattern": { "type": "string", "description": "Case-insensitive regex matched against shader name or hash (hotspots)." },
+                "warp_weighted": { "type": "boolean", "default": false, "description": "summary: also weight samples by the active warps counted per TPC, reproducing Nsight's GPUTrace.PCSampler export (stall reasons and shaders as avg warps / % of warp slots)." },
                 "vsmid": { "type": "integer", "minimum": 0, "description": "Only samples of this virtual SM (records)." },
                 "offset": page_offset_schema(), "limit": page_limit_schema()
             },

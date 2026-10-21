@@ -99,12 +99,12 @@ base in a single pass.
 
 ## Real-time shader profiler (PC sampling)
 
-These notes come from one Vulkan compute capture with samples (Nsight Graphics
-2026.3.1, RTX 4080 / AD103, driver 610.47) and two Vulkan captures without
-samples. Function addresses refer to the Nsight Graphics 2026.3.1 Windows
-binaries and are given so the findings can be re-checked against later
-releases. Each item states whether it is established (code or exact data
-match) or inferred (consistent with the data but not traced in code).
+These notes were checked with Nsight Graphics 2026.3.1 on Windows against
+Vulkan captures from an Ada GPU, with and without samples. Function addresses
+refer to the 2026.3.1 Windows binaries so the findings can be re-checked
+against later releases. Each item states whether it is established (code or
+exact match with the UI) or inferred (consistent with the data but not traced
+in code).
 
 ### Per-SM sample storage
 
@@ -118,7 +118,7 @@ entries have `version` 1.
 |---:|---|---|---|
 | `0x00` | `u64` | Sampled PC as a GPU virtual address | established |
 | `0x08` | `u32` | Observed `0` | — |
-| `0x0c` | `u8` | Values 0–47, frequencies in groups of four; probably the warp slot | inferred |
+| `0x0c` | `u8` | Warp slot; per shader the highest value is its warps per SM minus one | inferred |
 | `0x0d` | `u8` | Sample type (hardware stall reason code), see below | established |
 | `0x0e` | `u8` | Observed 0 or 1; `selected`/`not_selected` occur only with 0 | unknown |
 | `0x0f` | `u8` | Observed `0` | — |
@@ -129,11 +129,32 @@ cumulative sample index)`. Anchor `i` closes the samples
 count. Anchors are about 4 µs apart, and samples carry no individual
 timestamps.
 
-Nsight's sample total is smaller than the record count. In the AD103 capture
-1 548 958 records exist, the UI reports 1 539 536, and 2 765 records fall
-outside every code block. Counting only records whose anchor interval overlaps
-the presented frame gives 1 539 480 (midpoint interpolation: 1 539 219). The
-exact time window the UI applies is not yet established.
+The anchor times coincide with the ends of the PerfWorks periodic counter
+ranges. An SM apparently writes an anchor only for ranges in which it took
+samples (inferred: gaps occur where the SM's shader work pauses).
+
+#### Samples to counter ranges
+
+WarpViz (`0x18013dab0`) assigns every sample to one counter range; this is
+established from the code and from the exact UI total:
+
+1. The samples before an SM's first anchor are dropped, unless no further
+   anchor exists ("Keeping %zu pre-first-anchor PC samples …").
+2. Each later anchor closes the counter range that ends at its time.
+3. If an anchor's slot spans several ranges, its samples stay in the first
+   range of the gap. Only among the last 3 samples (`0x1808a2838`, the same
+   for every supported architecture) a sample and those after it move to the
+   range after the anchor. That happens to the first one that is closer by PC
+   to the next anchor's samples than to the current range's samples. The
+   distance is `|Δpc| / 3` plus a large penalty when the PCs lie in different
+   code blocks.
+
+A time range such as the UI's trace range contains the samples whose counter
+range overlaps it. This is established: it reproduces the UI's sample total
+exactly, while interpolated sample times or anchor intervals do not. The union
+of all anchor times serves as the range grid when the counter image is not at
+hand. `ngfx-trace` selects samples for every time-based scope this way, so a
+scope boundary inside a range takes the whole range.
 
 ### Sample type codes
 
@@ -170,12 +191,59 @@ Any other architecture gets the single entry `misc`. The tables name both
 long-scoreboard and both MIO-throttle codes identically. The pipe split is
 inferred from the auto-exported `GPUTrace.PCSampler.tpc__warps_issue_stalled_*`
 rows, which appear exactly in code order 1–20 and report zero for both RT-core
-variants, matching codes 8 and 14 never occurring in the compute-only capture.
-The AD103 capture reports `Arch` 400 (0x190) and uses the first table.
+variants, matching codes 8 and 14 never occurring in a compute-only capture.
+Ada GPUs report `Arch` 400 (0x190) and use the first table.
 
-The exported `GPUTrace.PCSampler` stall percentages are not plain sample
-shares: raw counts differ by up to 1.9 percentage points per reason. The
-weighting Nsight applies is not yet established.
+### Exported warp metrics (`GPUTrace.PCSampler`)
+
+The GPU Trace export reports stall reasons and shaders as
+`GPUTrace.PCSampler.tpc__warps_issue_stalled_<reason>` and
+`…tpc__warps_active_shader_node_main_<hash>`. These are not sample shares but
+warps per cycle: the samples are weighted by the active warps that the
+periodic counters measured. `PCSamplerMetricsEvaluator` in `WarpVizPlugin.dll`
+computes them (established from code; values match the export):
+
+- For every counter range, WarpViz evaluates two metrics per TPC instance
+  through `NVPW_MetricsEvaluator_EvaluateToInstanceValues` (`0x180142180`):
+  - `tpc__cycles_elapsed.avg`;
+  - `GPUTrace.tpc__warps_active_realtime.avg`, defined in the plugin
+    (`0x180002560`) as `tpc__warps_active_shader_vtg_realtime +
+    tpc__warps_active_shader_ps_realtime +
+    tpc__warps_active_shader_cs_queue_sync_realtime +
+    tpc__warps_active_shader_cs_queue_async_realtime` with peak 96.
+
+  The host library does not export the instance function by name. WarpViz
+  gets a resolver from `NVPA_GetProcAddress("1111")` and looks up the names
+  through it (`0x180151a40`).
+- The SM streams are sorted by `gpus[].gpuType.VsmMappings`
+  (`gpcPhysicalIndex`, `tpcPhysicalIndexInGpc`, `smPhysicalIndexInTpc`;
+  `0x18013d300`). Position `p` in that order belongs to TPC instance `p / 2`.
+  For Ampere, Ada, and Blackwell the plugin uses 2 SMs per TPC and 96 warps per
+  TPC.
+- In `0x18014fc20`, for counter range `r` and SM `s` with `n` samples in `r`,
+  every sample of `s` gets the weight
+  `min(warps[tpc(s)], 96 · cycles[tpc(s)]) / n / SM count`. Weights are summed
+  per sample type (`code − 1` indexes the reason list), per shader type, and
+  per shader hash. Samples outside known code blocks count as
+  `…_unattributed`.
+- The metric set's "Avg Warps" sub-metric is
+  `.avg.per_cycle_elapsed` × 0.5 (per SM); "Occupancy %" is that value over
+  48 warps. A range that only partly overlaps the reported range counts by its
+  time overlap.
+
+The metric set is stored in `gpus[].SamplingData.MetricSetAsString`
+(`Obfuscated: true`). Its `Data` is base64 text XORed byte by byte with
+`0x55`; it decodes to YAML with the metric definitions, sub-metric suffixes,
+and multipliers.
+
+`ngfx-trace pc-samples summary --warp-weighted` computes the values this way
+and matches the export to two decimals. A single value can still differ by
+0.01 percentage points; the cause is not established, and the PC lookup in the
+gap split (time-dependent in WarpViz) is a candidate.
+
+Raw sample shares are no substitute. Every active SM is sampled at the same
+rate however many warps it holds, so a shader limited to few warps per SM
+holds a much larger share of the samples than of the warps.
 
 ### Shader profiler blobs
 
@@ -232,22 +300,28 @@ modules lands on a non-debug instruction; at any other offset 30–115 lines
 land on `OpLine`, `OpLabel` or similar). The source file and line then come
 from the SPIR-V `OpLine` in effect for that instruction.
 
-Nsight keeps that line across `OpNoLine`, unlike the SPIR-V rule: in
-`detail_still.comp` an `OpSelect` after `OpNoLine` carries 0.19 % of all
-samples, and the UI counts them for the preceding line 119. Whether the line
-also survives `OpLabel` is not yet established; `ngfx-trace` ends it there.
-Restricted to the presented frame, this attribution reproduces all nine UI
-hotspot lines and the UI's per-instruction split of `detail_still.comp:106`
-to 0.01 percentage points.
+Unlike the SPIR-V rule, Nsight keeps that line across `OpNoLine` and `OpLabel`
+until the next `OpLine` or `OpFunctionEnd`. This is inferred from UI values:
+the UI counts samples on instructions after `OpNoLine` or `OpLabel` for the
+preceding line. With this rule, line and per-instruction shares match the UI's
+source view and hotspot table to 0.01 percentage points.
+
+The UI's hotspot table and source view count every code block, i.e. every
+pipeline, on its own (established by exact match). A source line that two
+pipelines of one module share appears once per pipeline.
+
+The instruction columns of the source view count every SASS instruction of the
+code block mapped to the line, sampled or not, in total and per instruction
+mix class. The per-line stall columns are plain sample shares of the line.
+Both are established by exact match.
 
 For `NonSemantic.Shader.DebugInfo.100` modules (`glslang -gVS`) `ngfx-trace`
 uses `DebugLine`, `DebugSource`, and `DebugCompilationUnit` the same way. The
 Nsight UI does not use this debug information, so this path has no UI
 reference.
 
-The UI's own SPIR-V line numbers differ (for example UI line 1402 for
-instruction index 564 of `detail_still.comp`); its listing apparently also
-counts embedded source text.
+The UI's own SPIR-V listing numbers lines differently from index + 6; it
+apparently also counts embedded source text.
 
 ### Instruction mix
 
@@ -279,10 +353,8 @@ counts embedded source text.
 
 `tools/generate_sass_classes.py` calls the four functions of the 2026.3.1
 plugin for all 8192 keys and writes `src/sass_classes.rs` (847 keys, eight SM
-versions). Restricted to the presented frame, the resulting instruction mix of
-the AD103 capture matches the UI to 0.01 percentage points: all eight listed
-classes and the split of `detail_still.comp:106` (LSU Shared Memory Load
-8.16 %, ALU Integer Arithmetic 3.49 %, FMA FP32 Math 0.37 %).
+versions). The resulting instruction mix matches the UI to 0.01 percentage
+points, both overall and per source line.
 
 ## Confidence and unknowns
 
@@ -302,18 +374,18 @@ Confirmed on the three Vulkan captures from Nsight Graphics 2026.3.1:
 - the 16-byte PC sample and timestamp anchor records (one capture with
   samples);
 - the per-architecture sample type tables in the 2026.3.1 WarpViz plugin;
-- the SASS instruction mix classification of the 2026.3.1 shader profiler.
+- the SASS instruction mix classification of the 2026.3.1 shader profiler;
+- WarpViz's sample-to-counter-range assignment and its `GPUTrace.PCSampler`
+  warp weighting (one capture with samples).
 
 Not yet established:
 
 - compatibility with WRPV versions other than 10;
 - official names or broader meanings of the section flag fields;
 - other compression identifiers or section roles;
-- the full set of proprietary `GPUTrace.*` formulas behind every UI row,
-  including the weighting of the exported PC sampler stall percentages;
-- the meaning of PC sample bytes `0x0c` and `0x0e`;
-- the exact time window behind the UI's sample total;
-- whether the UI carries source lines across `OpLabel`;
+- the full set of proprietary `GPUTrace.*` formulas behind every UI row;
+- the meaning of PC sample byte `0x0e`;
+- the cause of single 0.01-point differences in the exported warp weighting;
 - the UI's SPIR-V line numbering;
 - SASS mnemonics (the instruction mix classes need none);
 - PC sampling on architectures other than Ada and on D3D12 or OpenGL.

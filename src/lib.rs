@@ -41,7 +41,7 @@ pub use error::{Error, Result};
 pub use mcp::McpServer;
 pub use pc_sampling::{
     Hotspot, HotspotGrouping, HotspotReport, PcSample, PcSampling, PcSamplingSummary, SampleKind,
-    SampleRecord, SampleType,
+    SampleRecord, SampleType, TpcCounterRange, WarpWeightedCount, WarpWeightedSummary,
 };
 pub use perfworks::{
     CounterImage, CounterImageInfo, MetricAvailability, MetricBase, MetricCatalog,

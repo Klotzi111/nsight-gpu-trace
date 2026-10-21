@@ -237,6 +237,10 @@ enum PcSamplesCommand {
         /// capture, a stable scope ID, calls:A..B, time:A..B, or relative-time:A..B.
         #[arg(long, default_value = "capture")]
         scope: String,
+        /// Also weight the samples by the active warps the counters measured per
+        /// TPC, as Nsight's GPUTrace.PCSampler export does (loads PerfWorks).
+        #[arg(long)]
+        warp_weighted: bool,
     },
 
     /// Shader modules and code blocks with debug info and whole-capture sample counts.
@@ -692,12 +696,21 @@ fn metrics_command(command: MetricsCommand, options: AnalysisOptions) -> Result<
 
 fn pc_samples_command(command: PcSamplesCommand, options: AnalysisOptions) -> Result<Value> {
     match command {
-        PcSamplesCommand::Summary { trace, scope } => {
+        PcSamplesCommand::Summary {
+            trace,
+            scope,
+            warp_weighted,
+        } => {
             let mut analysis = Analysis::open(trace, options)?;
             let scope = analysis.parse_scope(&scope)?;
-            Ok(serde_json::to_value(
-                analysis.pc_sampling()?.summary(&scope)?,
-            )?)
+            let mut summary = serde_json::to_value(analysis.pc_sampling()?.summary(&scope)?)?;
+            if warp_weighted {
+                summary["warp_weighted"] = match analysis.pc_sampling_warp_weighted(&scope) {
+                    Ok(weighted) => serde_json::to_value(weighted)?,
+                    Err(error) => json!({ "error": error.to_string() }),
+                };
+            }
+            Ok(summary)
         }
         PcSamplesCommand::Shaders { trace } => {
             let mut analysis = Analysis::open(trace, options)?;
